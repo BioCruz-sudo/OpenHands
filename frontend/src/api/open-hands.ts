@@ -10,7 +10,39 @@ import {
   GetConfigResponse,
 } from "./open-hands.types";
 
+interface RateLimitInfo {
+  requestsRemaining: number;
+  resetTime: Date;
+  totalLimit: number;
+}
+
 class OpenHands {
+  private static rateLimitInfo: RateLimitInfo = {
+    requestsRemaining: Infinity,
+    resetTime: new Date(),
+    totalLimit: Infinity
+  };
+
+  private static updateRateLimitInfo(headers: Headers) {
+    const remaining = parseInt(headers.get('x-ratelimit-remaining') || 'Infinity');
+    const reset = headers.get('x-ratelimit-reset');
+    const limit = parseInt(headers.get('x-ratelimit-limit') || 'Infinity');
+
+    this.rateLimitInfo = {
+      requestsRemaining: remaining,
+      resetTime: reset ? new Date(parseInt(reset) * 1000) : new Date(),
+      totalLimit: limit
+    };
+  }
+
+  /**
+   * Get current rate limit information
+   * @returns Current rate limit status
+   */
+  static getRateLimitStatus(): RateLimitInfo {
+    return { ...this.rateLimitInfo };
+  }
+
   /**
    * Retrieve the list of models available
    * @returns List of models available
@@ -44,7 +76,7 @@ class OpenHands {
    * @returns List of security analyzers available
    */
   static async getSecurityAnalyzers(): Promise<string[]> {
-    const cachedData = cache.get<string[]>("agents");
+    const cachedData = cache.get<string[]>("security-analyzers"); // Fixed cache key
     if (cachedData) return cachedData;
 
     const data = await request(`/api/options/security-analyzers`);
@@ -69,9 +101,16 @@ class OpenHands {
    * @returns List of files available in the given path. If path is not provided, it lists all the files in the workspace
    */
   static async getFiles(path?: string): Promise<string[]> {
+    const cacheKey = path ? `files:${path}` : 'files:root';
+    const cachedData = cache.get<string[]>(cacheKey);
+    if (cachedData) return cachedData;
+
     let url = "/api/list-files";
     if (path) url += `?path=${encodeURIComponent(path)}`;
-    return request(url);
+    const data = await request(url);
+    cache.set(cacheKey, data);
+
+    return data;
   }
 
   /**
@@ -80,9 +119,16 @@ class OpenHands {
    * @returns Content of the file
    */
   static async getFile(path: string): Promise<string> {
+    const cacheKey = `file:${path}`;
+    const cachedData = cache.get<string>(cacheKey);
+    if (cachedData) return cachedData;
+
     const url = `/api/select-file?file=${encodeURIComponent(path)}`;
     const data = await request(url);
-    return data.code;
+    const content = data.code;
+    cache.set(cacheKey, content);
+
+    return content;
   }
 
   /**
@@ -95,13 +141,20 @@ class OpenHands {
     path: string,
     content: string,
   ): Promise<SaveFileSuccessResponse | ErrorResponse> {
-    return request(`/api/save-file`, {
+    const response = await request(`/api/save-file`, {
       method: "POST",
       body: JSON.stringify({ filePath: path, content }),
       headers: {
         "Content-Type": "application/json",
       },
     });
+
+    // Invalidate relevant caches
+    cache.delete(`file:${path}`);
+    cache.delete('files:root');
+    cache.delete(`files:${path.split('/').slice(0, -1).join('/')}`);
+
+    return response;
   }
 
   /**
@@ -115,10 +168,20 @@ class OpenHands {
     const formData = new FormData();
     file.forEach((f) => formData.append("files", f));
 
-    return request(`/api/upload-files`, {
+    const response = await request(`/api/upload-files`, {
       method: "POST",
       body: formData,
     });
+
+    // Invalidate file listing caches
+    cache.delete('files:root');
+    file.forEach(f => {
+      const path = f.webkitRelativePath || f.name;
+      const dir = path.split('/').slice(0, -1).join('/');
+      if (dir) cache.delete(`files:${dir}`);
+    });
+
+    return response;
   }
 
   /**
@@ -173,6 +236,21 @@ class OpenHands {
       },
       true,
     );
+  }
+
+  /**
+   * Check current rate limit status
+   * @returns Current rate limit information and reset time
+   */
+  static async checkRateLimit(): Promise<RateLimitInfo> {
+    try {
+      const response = await request('/api/rate-limit', {}, true);
+      this.rateLimitInfo = response;
+      return response;
+    } catch (error) {
+      // If rate limit endpoint is not available, return current stored info
+      return this.getRateLimitStatus();
+    }
   }
 }
 
